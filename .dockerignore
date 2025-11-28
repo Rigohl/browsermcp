@@ -1,0 +1,60 @@
+# Docker Ignore - Extreme Browser MCP
+# Optimizes build context and image size
+
+# Build artifacts
+target/
+**/*.rs.bk
+*.pdb
+
+# Development files
+.git/
+.gitignore
+README.md
+LICENSE
+*.md
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+*.tmp
+
+# Test and development
+tests/
+benches/
+examples/
+docs/
+
+# Logs and temporary files
+*.log
+.env
+.env.local
+*.pid
+*.seed
+*.pid.lock
+
+# Cache directories
+.cargo/
+node_modules/
+npm-debug.log*
+
+# Local development
+.mcp_backups/
+*.sqlite
+*.db
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+.travis.yml
+
+# Documentation
+CHANGELOG.md
+CONTRIBUTING.md
+CODE_OF_CONDUCT.md

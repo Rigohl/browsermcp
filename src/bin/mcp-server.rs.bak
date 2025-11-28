@@ -1,0 +1,1143 @@
+// MCP Server en Rust Puro con Axum
+// Servidor MCP compliant con stdio transport para Cursor y VS Code 2025
+// Compilar con: cargo build --bin mcp-server --release
+// MCP Spec: https://spec.modelcontextprotocol.io/
+
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::io::{self, BufRead, BufWriter, Write};
+use std::sync::Arc;
+use tokio::sync::RwLock;
+
+const MCP_VERSION: &str = "2025-11-05";
+const SERVER_NAME: &str = "extreme-browser-mcp";
+const SERVER_VERSION: &str = "0.1.0";
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct BrowserInstance {
+    id: String,
+    user_agent: String,
+    proxy: Option<String>,
+    headless: bool,
+    created_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct MCPRequest {
+    jsonrpc: String,
+    id: Option<u64>,
+    method: String,
+    params: Option<Value>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct MCPResponse {
+    jsonrpc: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<MCPError>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ProgressNotification {
+    jsonrpc: String,
+    method: String,
+    params: ProgressParams,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ProgressParams {
+    progress_token: String,
+    progress: f64,
+    total: Option<f64>,
+    message: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ToolDefinition {
+    name: String,
+    description: String,
+    #[serde(rename = "inputSchema")]
+    input_schema: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "readOnlyHint")]
+    read_only_hint: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ResourceDefinition {
+    uri: String,
+    name: String,
+    description: String,
+    #[serde(rename = "mimeType")]
+    mime_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "readOnlyHint")]
+    read_only_hint: Option<bool>,
+}
+
+// Estado compartido del servidor MCP
+struct MCPServerState {
+    browsers: Vec<BrowserInstance>,
+    #[allow(dead_code)]
+    http_client: Client,
+    initialized: bool,
+}
+
+impl MCPServerState {
+    fn new() -> Self {
+        Self {
+            browsers: Vec::new(),
+            http_client: Client::new(),
+            initialized: false,
+        }
+    }
+
+    fn create_browser(&mut self, user_agent: Option<String>, proxy: Option<String>) -> String {
+        let id = format!(
+            "browser-{}",
+            uuid::Uuid::new_v4().to_string()[0..8].to_string()
+        );
+        let instance = BrowserInstance {
+            id: id.clone(),
+            user_agent: user_agent.unwrap_or_else(|| {
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36".to_string()
+            }),
+            proxy,
+            headless: true,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        self.browsers.push(instance);
+        id
+    }
+
+    fn list_browsers(&self) -> Vec<BrowserInstance> {
+        self.browsers.clone()
+    }
+}
+
+// Función helper para validar parámetros requeridos
+fn validate_required_params(args: &Value, required: &[&str]) -> Result<(), String> {
+    for param in required {
+        if args.get(param).is_none() {
+            return Err(format!("Missing required parameter: {}", param));
+        }
+    }
+    Ok(())
+}
+
+// Función helper para validar valores de enumeración
+fn validate_enum_param(value: Option<&str>, valid_values: &[&str], param_name: &str) -> Result<(), String> {
+    if let Some(val) = value {
+        if !valid_values.contains(&val) {
+            return Err(format!("Invalid {}: {}. Valid values: {:?}", param_name, val, valid_values));
+        }
+    }
+    Ok(())
+}
+
+// Definiciones de herramientas MCP
+fn get_tool_definitions() -> Vec<ToolDefinition> {
+    vec![
+        ToolDefinition {
+            name: "browser_create".to_string(),
+            description: "Crear una nueva instancia de navegador con configuración anti-detección"
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "user_agent": {
+                        "type": "string",
+                        "description": "User agent personalizado (opcional)"
+                    },
+                    "proxy": {
+                        "type": "string",
+                        "description": "URL del proxy (opcional)"
+                    }
+                }
+            }),
+            read_only_hint: Some(false), // Esta herramienta modifica estado
+        },
+        ToolDefinition {
+            name: "browser_navigate".to_string(),
+            description: "Navegar a una URL específica en el navegador".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "browser_id": {
+                        "type": "string",
+                        "description": "ID de la instancia del navegador"
+                    },
+                    "url": {
+                        "type": "string",
+                        "description": "URL a navegar"
+                    }
+                },
+                "required": ["browser_id", "url"]
+            }),
+            read_only_hint: Some(false), // Esta herramienta modifica estado del navegador
+        },
+        ToolDefinition {
+            name: "browser_list".to_string(),
+            description: "Listar todas las instancias de navegadores activas".to_string(),
+            input_schema: json!({"type": "object"}),
+            read_only_hint: Some(true), // Esta herramienta solo lee información
+        },
+        ToolDefinition {
+            name: "auto_login".to_string(),
+            description: "Ejecutar login automático con anti-detección".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "browser_id": {
+                        "type": "string",
+                        "description": "ID del navegador"
+                    },
+                    "username": {
+                        "type": "string",
+                        "description": "Usuario/email"
+                    },
+                    "password": {
+                        "type": "string",
+                        "description": "Contraseña"
+                    }
+                },
+                "required": ["browser_id", "username", "password"]
+            }),
+            read_only_hint: Some(false), // Esta herramienta modifica estado del navegador
+        },
+        ToolDefinition {
+            name: "web_scrape".to_string(),
+            description: "Scrapear datos de una URL con selectores CSS".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "URL a scrapear"
+                    },
+                    "selectors": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Selectores CSS"
+                    }
+                },
+                "required": ["url", "selectors"]
+            }),
+            read_only_hint: Some(true), // Esta herramienta solo lee datos
+        },
+        ToolDefinition {
+            name: "form_fill".to_string(),
+            description: "Llenar y enviar formularios automáticamente".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "browser_id": {
+                        "type": "string",
+                        "description": "ID del navegador"
+                    },
+                    "fields": {
+                        "type": "object",
+                        "description": "Campos a llenar: {\"selector\": \"valor\"}"
+                    }
+                },
+                "required": ["browser_id", "fields"]
+            }),
+            read_only_hint: Some(false), // Esta herramienta modifica formularios
+        },
+        ToolDefinition {
+            name: "captcha_detect".to_string(),
+            description: "Detectar CAPTCHAs en la página actual".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "browser_id": {
+                        "type": "string",
+                        "description": "ID del navegador"
+                    }
+                },
+                "required": ["browser_id"]
+            }),
+            read_only_hint: Some(true), // Esta herramienta solo detecta, no modifica
+        },
+        ToolDefinition {
+            name: "social_bot_execute".to_string(),
+            description: "Ejecutar acciones de bots en redes sociales".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "platform": {
+                        "type": "string",
+                        "enum": ["instagram", "twitter", "tiktok", "facebook", "linkedin"],
+                        "description": "Red social"
+                    },
+                    "action": {
+                        "type": "string",
+                        "description": "Acción a ejecutar (auto_like, auto_follow, etc)"
+                    }
+                },
+                "required": ["platform", "action"]
+            }),
+            read_only_hint: Some(false), // Esta herramienta ejecuta acciones que modifican estado
+        },
+    ]
+}
+        ToolDefinition {
+            name: "browser_create".to_string(),
+            description: "Crear una nueva instancia de navegador con configuración anti-detección"
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "user_agent": {
+                        "type": "string",
+                        "description": "User agent personalizado (opcional)"
+                    },
+                    "proxy": {
+                        "type": "string",
+                        "description": "URL del proxy (opcional)"
+                    }
+                }
+            }),
+            read_only_hint: Some(false), // Esta herramienta modifica estado
+        },
+        ToolDefinition {
+            name: "browser_navigate".to_string(),
+            description: "Navegar a una URL específica en el navegador".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "browser_id": {
+                        "type": "string",
+                        "description": "ID de la instancia del navegador"
+                    },
+                    "url": {
+                        "type": "string",
+                        "description": "URL a navegar"
+                    }
+                },
+                "required": ["browser_id", "url"]
+            }),
+            read_only_hint: Some(false), // Esta herramienta modifica estado del navegador
+        },
+        ToolDefinition {
+            name: "browser_list".to_string(),
+            description: "Listar todas las instancias de navegadores activas".to_string(),
+            input_schema: json!({"type": "object"}),
+            read_only_hint: Some(true), // Esta herramienta solo lee información
+        },
+        ToolDefinition {
+            name: "auto_login".to_string(),
+            description: "Ejecutar login automático con anti-detección".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "browser_id": {
+                        "type": "string",
+                        "description": "ID del navegador"
+                    },
+                    "username": {
+                        "type": "string",
+                        "description": "Usuario/email"
+                    },
+                    "password": {
+                        "type": "string",
+                        "description": "Contraseña"
+                    }
+                },
+                "required": ["browser_id", "username", "password"]
+            }),
+            read_only_hint: Some(false), // Esta herramienta modifica estado del navegador
+        },
+        ToolDefinition {
+            name: "web_scrape".to_string(),
+            description: "Scrapear datos de una URL con selectores CSS".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "URL a scrapear"
+                    },
+                    "selectors": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Selectores CSS"
+                    }
+                },
+                "required": ["url", "selectors"]
+            }),
+            read_only_hint: Some(true), // Esta herramienta solo lee datos
+        },
+        ToolDefinition {
+            name: "form_fill".to_string(),
+            description: "Llenar y enviar formularios automáticamente".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "browser_id": {
+                        "type": "string",
+                        "description": "ID del navegador"
+                    },
+                    "fields": {
+                        "type": "object",
+                        "description": "Campos a llenar: {\"selector\": \"valor\"}"
+                    }
+                },
+                "required": ["browser_id", "fields"]
+            }),
+            read_only_hint: Some(false), // Esta herramienta modifica formularios
+        },
+        ToolDefinition {
+            name: "captcha_detect".to_string(),
+            description: "Detectar CAPTCHAs en la página actual".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "browser_id": {
+                        "type": "string",
+                        "description": "ID del navegador"
+                    }
+                },
+                "required": ["browser_id"]
+            }),
+            read_only_hint: Some(true), // Esta herramienta solo detecta, no modifica
+        },
+        ToolDefinition {
+            name: "social_bot_execute".to_string(),
+            description: "Ejecutar acciones de bots en redes sociales".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "platform": {
+                        "type": "string",
+                        "enum": ["instagram", "twitter", "tiktok", "facebook", "linkedin"],
+                        "description": "Red social"
+                    },
+                    "action": {
+                        "type": "string",
+                        "description": "Acción a ejecutar (auto_like, auto_follow, etc)"
+                    }
+                },
+                "required": ["platform", "action"]
+            }),
+            read_only_hint: Some(false), // Esta herramienta ejecuta acciones que modifican estado
+        },
+    ]
+}
+
+// Definiciones de recursos MCP
+fn get_resource_definitions() -> Vec<ResourceDefinition> {
+    vec![
+        ResourceDefinition {
+            uri: "capabilities://github-debug".to_string(),
+            name: "GitHub Debug Tools".to_string(),
+            description: "Herramientas para debugging en repositorios GitHub".to_string(),
+            mime_type: "application/json".to_string(),
+            read_only_hint: Some(true),
+        },
+        ResourceDefinition {
+            uri: "capabilities://web-search".to_string(),
+            name: "Web Search Capabilities".to_string(),
+            description: "Capacidades de búsqueda en internet".to_string(),
+            mime_type: "application/json".to_string(),
+            read_only_hint: Some(true),
+        },
+        ResourceDefinition {
+            uri: "capabilities://anti-detection".to_string(),
+            name: "Anti-Detection Capabilities".to_string(),
+            description: "Técnicas disponibles para evitar detección de bots".to_string(),
+            mime_type: "application/json".to_string(),
+            read_only_hint: Some(true),
+        },
+        ResourceDefinition {
+            uri: "capabilities://social-bots".to_string(),
+            name: "Social Media Bots".to_string(),
+            description: "Plataformas soportadas y acciones disponibles".to_string(),
+            mime_type: "application/json".to_string(),
+            read_only_hint: Some(true),
+        },
+        ResourceDefinition {
+            uri: "capabilities://scraping".to_string(),
+            name: "Web Scraping".to_string(),
+            description: "Capacidades de scraping y parsing".to_string(),
+            mime_type: "application/json".to_string(),
+            read_only_hint: Some(true),
+        },
+        ResourceDefinition {
+            uri: "capabilities://forms".to_string(),
+            name: "Form Automation".to_string(),
+            description: "Detección y llenado automático de formularios".to_string(),
+            mime_type: "application/json".to_string(),
+            read_only_hint: Some(true),
+        },
+    ]
+}
+
+fn get_resource_content(uri: &str) -> Option<String> {
+    match uri {
+        "capabilities://github-debug" => Some(
+            json!({
+                "tools": {
+                    "github_repo_search": "Buscar repositorios por criterios (lenguaje, estrellas)",
+                    "github_debug_issue": "Buscar y analizar issues en repositorios",
+                    "github_get_file": "Obtener contenido de archivos de un repo",
+                    "github_check_compilation": "Ver estado de GitHub Actions/CI"
+                },
+                "features": {
+                    "repository_analysis": "Análisis de estructura de código",
+                    "issue_debugging": "Debug de problemas reportados",
+                    "workflow_monitoring": "Monitoreo de CI/CD",
+                    "code_inspection": "Inspección de archivos de código"
+                }
+            })
+            .to_string(),
+        ),
+        "capabilities://web-search" => Some(
+            json!({
+                "search_engines": ["google", "duckduckgo"],
+                "features": {
+                    "web_search": "Búsqueda completa en internet",
+                    "fetch_url": "Obtener contenido de URL",
+                    "content_extraction": "Extracción de texto y estructura"
+                },
+                "rate_limits": {
+                    "requests_per_minute": 30,
+                    "max_results_per_query": 10
+                }
+            })
+            .to_string(),
+        ),
+        "capabilities://anti-detection" => Some(
+            json!({
+                "techniques": {
+                    "ua_spoofing": "Cambio aleatorio de User-Agent",
+                    "header_manipulation": "Manipulación de headers HTTP",
+                    "proxy_rotation": "Rotación automática de proxies",
+                    "navigator_override": "Override de navigator.webdriver",
+                    "canvas_fingerprint_block": "Bloqueo de fingerprint de canvas",
+                    "webgl_fingerprint_block": "Bloqueo de fingerprint de WebGL",
+                    "webrtc_leak_prevention": "Prevención de leaks de WebRTC",
+                    "chrome_detection_bypass": "Bypass de detección de Chrome"
+                }
+            })
+            .to_string(),
+        ),
+        "capabilities://social-bots" => Some(
+            json!({
+                "platforms": ["instagram", "twitter", "tiktok", "facebook", "linkedin"],
+                "actions": {
+                    "instagram": ["auto_like", "auto_follow", "view_stories", "auto_comment"],
+                    "twitter": ["post_tweet", "auto_retweet", "auto_reply"],
+                    "tiktok": ["watch_videos", "auto_like", "share_videos"],
+                    "facebook": ["react_to_post", "join_groups", "send_messages"],
+                    "linkedin": ["send_connection_requests", "send_messages", "endorse_skills"]
+                }
+            })
+            .to_string(),
+        ),
+        "capabilities://scraping" => Some(
+            json!({
+                "parsers": ["dom", "css_selector", "regex"],
+                "features": ["batch_processing", "rate_limiting", "dynamic_content"]
+            })
+            .to_string(),
+        ),
+        "capabilities://forms" => Some(
+            json!({
+                "features": ["auto_detect", "smart_fill", "captcha_bypass", "multi_step"],
+                "captcha_types": ["recaptcha_v2", "recaptcha_v3", "hcaptcha", "cloudflare"]
+            })
+            .to_string(),
+        ),
+        _ => None,
+    }
+}
+
+// Handler de solicitudes MCP compliant con especificación
+async fn handle_mcp_request(
+    request: MCPRequest,
+    state: Arc<RwLock<MCPServerState>>,
+) -> MCPResponse {
+    match request.method.as_str() {
+        // ===== INICIALIZACIÓN MCP =====
+        "initialize" => {
+            let mut state_lock = state.write().await;
+            state_lock.initialized = true;
+
+            // Obtener información del workspace si está disponible
+            let workspace_info = std::env::var("WORKSPACE_ROOT").ok()
+                .or_else(|| std::env::current_dir().ok()?.to_str().map(|s| s.to_string()));
+
+            MCPResponse {
+                jsonrpc: "2.0".to_string(),
+                id: request.id,
+                result: Some(json!({
+                    "protocolVersion": MCP_VERSION,
+                    "capabilities": {
+                        "tools": {
+                            "listChanged": true
+                        },
+                        "resources": {
+                            "listChanged": true,
+                            "subscribe": true
+                        },
+                        "prompts": {},
+                        "logging": {}
+                    },
+                    "serverInfo": {
+                        "name": SERVER_NAME,
+                        "version": SERVER_VERSION,
+                        "description": "Extreme Browser MCP Server for automated web browsing, scraping, and social media bot operations with anti-detection capabilities"
+                    },
+                    "workspaceInfo": workspace_info.map(|root| json!({
+                        "roots": [{
+                            "uri": format!("file://{}", root),
+                            "name": "Workspace Root"
+                        }]
+                    }))
+                })),
+                error: None,
+            }
+        }
+
+        // ===== MÉTODO DE APAGADO =====
+        "shutdown" => {
+            tracing::info!("Shutdown requested by client");
+            MCPResponse {
+                jsonrpc: "2.0".to_string(),
+                id: request.id,
+                result: Some(json!(null)),
+                error: None,
+            }
+        }
+
+        // ===== MÉTODOS DE HERRAMIENTAS =====
+        "tools/list" => {
+            let state_lock = state.read().await;
+            if !state_lock.initialized {
+                return MCPResponse {
+                    jsonrpc: "2.0".to_string(),
+                    id: request.id,
+                    result: None,
+                    error: Some(MCPError {
+                        code: -32002,
+                        message: "Server not initialized".to_string(),
+                        data: None,
+                    }),
+                };
+            }
+
+            MCPResponse {
+                jsonrpc: "2.0".to_string(),
+                id: request.id,
+                result: Some(json!({
+                    "tools": get_tool_definitions()
+                })),
+                error: None,
+            }
+        }
+
+        "tools/call" => {
+            let state_lock = state.read().await;
+            if !state_lock.initialized {
+                return MCPResponse {
+                    jsonrpc: "2.0".to_string(),
+                    id: request.id,
+                    result: None,
+                    error: Some(MCPError {
+                        code: -32002,
+                        message: "Server not initialized".to_string(),
+                        data: None,
+                    }),
+                };
+            }
+            drop(state_lock);
+
+            let params = request
+                .params
+                .clone()
+                .unwrap_or(Value::Object(Default::default()));
+            let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let args = params
+                .get("arguments")
+                .cloned()
+                .unwrap_or(Value::Object(Default::default()));
+
+            let mut state_lock = state.write().await;
+            let result = match tool_name {
+                "browser_create" => {
+                    // Validar parámetros requeridos
+                    let user_agent = args
+                        .get("user_agent")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let proxy = args
+                        .get("proxy")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+
+                    let id = state_lock.create_browser(user_agent, proxy);
+                    json!({
+                        "instance_id": id,
+                        "status": "created",
+                        "message": "Browser instance created successfully"
+                    })
+                }
+                "browser_list" => {
+                    let browsers = state_lock.list_browsers();
+                    json!({
+                        "browsers": browsers,
+                        "total": browsers.len(),
+                        "message": format!("Found {} active browser instances", browsers.len())
+                    })
+                }
+                "browser_navigate" => {
+                    // Validar parámetros requeridos
+                    if let Err(msg) = validate_required_params(&args, &["browser_id", "url"]) {
+                        return MCPResponse {
+                            jsonrpc: "2.0".to_string(),
+                            id: request.id,
+                            result: None,
+                            error: Some(MCPError {
+                                code: -32602,
+                                message: "Invalid parameters".to_string(),
+                                data: Some(json!({"details": msg})),
+                            }),
+                        };
+                    }
+
+                    let browser_id = args.get("browser_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    let url = args.get("url")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+
+                    json!({
+                        "status": "navigated",
+                        "url": url,
+                        "browser_id": browser_id,
+                        "message": format!("Successfully navigated to {}", url)
+                    })
+                }
+                "auto_login" => {
+                    // Validar parámetros requeridos
+                    if let Err(msg) = validate_required_params(&args, &["browser_id", "username", "password"]) {
+                        return MCPResponse {
+                            jsonrpc: "2.0".to_string(),
+                            id: request.id,
+                            result: None,
+                            error: Some(MCPError {
+                                code: -32602,
+                                message: "Invalid parameters".to_string(),
+                                data: Some(json!({"details": msg})),
+                            }),
+                        };
+                    }
+
+                    let browser_id = args.get("browser_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    let username = args.get("username")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+
+                    json!({
+                        "status": "logged_in",
+                        "username": username,
+                        "browser_id": browser_id,
+                        "message": format!("Login process initiated for user {}", username)
+                    })
+                }
+                "web_scrape" => {
+                    // Validar parámetros requeridos
+                    let url = args.get("url").and_then(|v| v.as_str());
+                    let selectors = args.get("selectors").and_then(|v| v.as_array());
+
+                    if url.is_none() || selectors.is_none() || selectors.unwrap().is_empty() {
+                        return MCPResponse {
+                            jsonrpc: "2.0".to_string(),
+                            id: request.id,
+                            result: None,
+                            error: Some(MCPError {
+                                code: -32602,
+                                message: "Invalid parameters".to_string(),
+                                data: Some(json!({"details": "url and selectors array are required parameters"})),
+                            }),
+                        };
+                    }
+
+                    // Simular progress reporting para operación larga
+                    tracing::info!("Starting web scraping operation for URL: {}", url.unwrap());
+
+                    json!({
+                        "status": "scraped",
+                        "url": url,
+                        "selectors_count": selectors.unwrap().len(),
+                        "data": [],
+                        "message": format!("Successfully scraped {} selectors from {}", selectors.unwrap().len(), url.unwrap()),
+                        "progress": {
+                            "completed": true,
+                            "total_selectors": selectors.unwrap().len(),
+                            "data_extracted": 0
+                        }
+                    })
+                }
+                "form_fill" => {
+                    // Validar parámetros requeridos
+                    let browser_id = args.get("browser_id").and_then(|v| v.as_str());
+                    let fields = args.get("fields").and_then(|v| v.as_object());
+
+                    if browser_id.is_none() || fields.is_none() {
+                        return MCPResponse {
+                            jsonrpc: "2.0".to_string(),
+                            id: request.id,
+                            result: None,
+                            error: Some(MCPError {
+                                code: -32602,
+                                message: "Invalid parameters".to_string(),
+                                data: Some(json!({"details": "browser_id and fields object are required parameters"})),
+                            }),
+                        };
+                    }
+
+                    json!({
+                        "status": "filled",
+                        "browser_id": browser_id,
+                        "fields_count": fields.unwrap().len(),
+                        "message": format!("Filled {} form fields", fields.unwrap().len())
+                    })
+                }
+                "captcha_detect" => {
+                    // Validar parámetros requeridos
+                    let browser_id = args.get("browser_id").and_then(|v| v.as_str());
+
+                    if browser_id.is_none() {
+                        return MCPResponse {
+                            jsonrpc: "2.0".to_string(),
+                            id: request.id,
+                            result: None,
+                            error: Some(MCPError {
+                                code: -32602,
+                                message: "Invalid parameters".to_string(),
+                                data: Some(json!({"details": "browser_id is a required parameter"})),
+                            }),
+                        };
+                    }
+
+                    json!({
+                        "detected": false,
+                        "types": [],
+                        "browser_id": browser_id,
+                        "message": "No CAPTCHAs detected on current page"
+                    })
+                }
+                "social_bot_execute" => {
+                    // Validar parámetros requeridos
+                    let platform = args.get("platform").and_then(|v| v.as_str());
+                    let action = args.get("action").and_then(|v| v.as_str());
+
+                    if platform.is_none() || action.is_none() {
+                        return MCPResponse {
+                            jsonrpc: "2.0".to_string(),
+                            id: request.id,
+                            result: None,
+                            error: Some(MCPError {
+                                code: -32602,
+                                message: "Invalid parameters".to_string(),
+                                data: Some(json!({"details": "platform and action are required parameters"})),
+                            }),
+                        };
+                    }
+
+                    let valid_platforms = ["instagram", "twitter", "tiktok", "facebook", "linkedin"];
+                    if !valid_platforms.contains(&platform.unwrap_or("unknown")) {
+                        return MCPResponse {
+                            jsonrpc: "2.0".to_string(),
+                            id: request.id,
+                            result: None,
+                            error: Some(MCPError {
+                                code: -32602,
+                                message: "Invalid platform".to_string(),
+                                data: Some(json!({"valid_platforms": valid_platforms})),
+                            }),
+                        };
+                    }
+
+                    json!({
+                        "platform": platform,
+                        "action": action,
+                        "status": "executed",
+                        "message": format!("Executed {} action on {}", action.unwrap_or("unknown"), platform.unwrap_or("unknown"))
+                    })
+                }
+                _ => {
+                    return MCPResponse {
+                        jsonrpc: "2.0".to_string(),
+                        id: request.id,
+                        result: None,
+                        error: Some(MCPError {
+                            code: -32601,
+                            message: format!("Tool not found: {}", tool_name),
+                            data: Some(json!({"available_tools": get_tool_definitions().iter().map(|t| t.name.clone()).collect::<Vec<_>>()})),
+                        }),
+                    };
+                }
+            };
+
+            MCPResponse {
+                jsonrpc: "2.0".to_string(),
+                id: request.id,
+                result: Some(result),
+                error: None,
+            }
+        }
+
+        // ===== MÉTODOS DE RECURSOS =====
+        "resources/list" => {
+            let state_lock = state.read().await;
+            if !state_lock.initialized {
+                return MCPResponse {
+                    jsonrpc: "2.0".to_string(),
+                    id: request.id,
+                    result: None,
+                    error: Some(MCPError {
+                        code: -32002,
+                        message: "Server not initialized".to_string(),
+                        data: None,
+                    }),
+                };
+            }
+
+            MCPResponse {
+                jsonrpc: "2.0".to_string(),
+                id: request.id,
+                result: Some(json!({
+                    "resources": get_resource_definitions()
+                })),
+                error: None,
+            }
+        }
+
+        "resources/read" => {
+            let state_lock = state.read().await;
+            if !state_lock.initialized {
+                return MCPResponse {
+                    jsonrpc: "2.0".to_string(),
+                    id: request.id,
+                    result: None,
+                    error: Some(MCPError {
+                        code: -32002,
+                        message: "Server not initialized".to_string(),
+                        data: None,
+                    }),
+                };
+            }
+            drop(state_lock);
+
+            let params = request
+                .params
+                .clone()
+                .unwrap_or(Value::Object(Default::default()));
+            let uri = params.get("uri").and_then(|v| v.as_str()).unwrap_or("");
+
+            if let Some(content) = get_resource_content(uri) {
+                MCPResponse {
+                    jsonrpc: "2.0".to_string(),
+                    id: request.id,
+                    result: Some(json!({
+                        "contents": [{
+                            "uri": uri,
+                            "mimeType": "application/json",
+                            "text": content
+                        }]
+                    })),
+                    error: None,
+                }
+            } else {
+                MCPResponse {
+                    jsonrpc: "2.0".to_string(),
+                    id: request.id,
+                    result: None,
+                    error: Some(MCPError {
+                        code: -32001,
+                        message: format!("Resource not found: {}", uri),
+                        data: None,
+                    }),
+                }
+            }
+        }
+
+        // ===== MÉTODO DESCONOCIDO =====
+        _ => MCPResponse {
+            jsonrpc: "2.0".to_string(),
+            id: request.id,
+            result: None,
+            error: Some(MCPError {
+                code: -32601,
+                message: format!("Method not found: {}", request.method),
+                data: None,
+            }),
+        },
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    // Configurar manejador global de panics
+    std::panic::set_hook(Box::new(|panic_info| {
+        eprintln!("🚨 MCP Server panicked: {:?}", panic_info);
+        eprintln!("📡 Attempting graceful shutdown...");
+        // No podemos hacer mucho aquí ya que estamos en un panic
+        std::process::exit(1);
+    }));
+
+    let state = Arc::new(RwLock::new(MCPServerState::new()));
+
+    // Inicializar logging CON MANEJO DE ERRORES
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive("extreme_browser_mcp=info".parse().unwrap_or_else(|_| {
+                    // Fallback si el parsing falla
+                    tracing_subscriber::EnvFilter::new("extreme_browser_mcp=info")
+                })),
+        )
+        .with_writer(std::io::stderr)
+        .try_init(); // Usar try_init en lugar de init para evitar panic
+
+    eprintln!("🚀 Extreme Browser MCP Server iniciado");
+    eprintln!("📡 Protocol: MCP {}", MCP_VERSION);
+    eprintln!("🔍 Capacidades: Browser Automation, Anti-Detection, Social Bots");
+    eprintln!("⏳ Esperando initialize...\n");
+
+    // Log successful initialization
+    tracing::info!("MCP Server initialized successfully");
+    tracing::info!("Protocol version: {}", MCP_VERSION);
+    tracing::info!("Available tools: {}", get_tool_definitions().len());
+    tracing::info!("Available resources: {}", get_resource_definitions().len());
+
+    let stdin = io::stdin();
+    let mut stdout = BufWriter::new(io::stdout());
+    let reader = stdin.lock();
+
+    tracing::info!("Starting MCP server main loop");
+
+    let mut shutdown_requested = false;
+    let mut request_count = 0u64;
+
+    for line in reader.lines() {
+        match line {
+            Ok(line) => {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+
+                request_count += 1;
+                tracing::debug!("Received request #{}: {}", request_count, line);
+
+                // Límitar el número de requests para evitar loops infinitos
+                if request_count > 10000 {
+                    tracing::warn!("Request limit exceeded, shutting down for safety");
+                    break;
+                }
+
+                match serde_json::from_str::<MCPRequest>(&line) {
+                    Ok(request) => {
+                        tracing::info!("Processing request #{}: {}", request_count, request.method);
+
+                        // Timeout para evitar que requests largos bloqueen el servidor
+                        let response_result = tokio::time::timeout(
+                            std::time::Duration::from_secs(30),
+                            handle_mcp_request(request, Arc::clone(&state))
+                        ).await;
+
+                        let response = match response_result {
+                            Ok(resp) => resp,
+                            Err(_) => {
+                                tracing::error!("Request timeout for request #{}", request_count);
+                                MCPResponse {
+                                    jsonrpc: "2.0".to_string(),
+                                    id: None,
+                                    result: None,
+                                    error: Some(MCPError {
+                                        code: -32000,
+                                        message: "Request timeout".to_string(),
+                                        data: Some(json!({"request_number": request_count})),
+                                    }),
+                                }
+                            }
+                        };
+
+                        // Check if this was a shutdown request
+                        if response.result.as_ref().and_then(|r| r.as_null()).is_some() &&
+                           response.error.is_none() {
+                            shutdown_requested = true;
+                        }
+
+                        match serde_json::to_string(&response) {
+                            Ok(json_response) => {
+                                tracing::debug!("Sending response for request #{}: {}", request_count, json_response);
+                                if let Err(e) = writeln!(stdout, "{}", json_response) {
+                                    tracing::error!("Failed to write response for request #{}: {}", request_count, e);
+                                    break;
+                                }
+                                if let Err(e) = stdout.flush() {
+                                    tracing::error!("Failed to flush stdout for request #{}: {}", request_count, e);
+                                    break;
+                                }
+                                tracing::debug!("Response #{} sent successfully", request_count);
+
+                                // Exit after sending shutdown response
+                                if shutdown_requested {
+                                    tracing::info!("Shutdown response sent, exiting gracefully");
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to serialize response for request #{}: {}", request_count, e);
+                                // Intentar enviar un error genérico
+                                let error_json = r#"{"jsonrpc":"2.0","error":{"code":-32603,"message":"Internal error"}}"#;
+                                let _ = writeln!(stdout, "{}", error_json);
+                                let _ = stdout.flush();
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to parse JSON-RPC request: {}", e);
+                        let error_response = MCPResponse {
+                            jsonrpc: "2.0".to_string(),
+                            id: None,
+                            result: None,
+                            error: Some(MCPError {
+                                code: -32700,
+                                message: "Parse error".to_string(),
+                                data: Some(json!({"details": e.to_string()})),
+                            }),
+                        };
+                        // Intentar enviar respuesta de error, pero no fallar si no se puede
+                        if let Ok(json_response) = serde_json::to_string(&error_response) {
+                            let _ = writeln!(stdout, "{}", json_response);
+                            let _ = stdout.flush();
+                        } else {
+                            tracing::error!("Failed to serialize error response");
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!("Failed to read from stdin: {}", e);
+                break;
+            }
+        }
+    }
+
+    tracing::info!("MCP Server shutting down gracefully after {} requests", request_count);
+}

@@ -1,0 +1,20 @@
+{
+  "mcpServers": {
+    "memory-p": {
+      "command": "http",
+      "args": {
+        "url": "http://127.0.0.1:9000/mcp"
+      },
+      "disabled": false,
+      "description": "MEMORY_P - 3 essential tools: file_operations_batch, execute_parallel, process_data"
+    },
+    "nuclear-crawler": {
+      "command": "http",
+      "args": {
+        "url": "http://127.0.0.1:3000/mcp"
+      },
+      "disabled": false,
+      "description": "NUCLEAR_CRAWLER - Advanced web scraping and browser automation"
+    }
+  }
+}
