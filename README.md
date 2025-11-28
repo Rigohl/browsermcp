@@ -37,6 +37,7 @@
 
 ## 🚀 Quick Start
 
+### Local Development
 ```bash
 cd browsermcp
 cargo build --release
@@ -44,6 +45,41 @@ cargo build --release
 ```
 
 Server en: **http://127.0.0.1:3001**
+
+### ☁️ Cloud Deployment (Google Cloud Run)
+
+**Always Free Tier: 2M requests/month at $0**
+
+1. **Create GCP Service Account** (one-time setup):
+```bash
+# In Google Cloud Console:
+# 1. Create new service account
+# 2. Grant roles: roles/run.admin + roles/artifactregistry.admin
+# 3. Generate JSON key
+# 4. Encode key: cat key.json | base64 -w 0
+```
+
+2. **Add GitHub Secrets** to repository:
+   - `GCP_PROJECT_ID`: Your GCP project ID
+   - `GCP_SA_KEY`: Base64-encoded service account key
+
+3. **Deploy**:
+```bash
+# Automatic on every push to master (via GitHub Actions)
+# Or manual trigger:
+git commit --allow-empty -m "Deploy to Cloud Run"
+git push origin master
+```
+
+4. **Monitor Deployment**:
+   - GitHub Actions: https://github.com/Rigohl/browsermcp/actions
+   - Cloud Run Console: https://console.cloud.google.com/run
+   - Service URL will be printed in GitHub Actions logs
+
+5. **Test Cloud Run Endpoint**:
+```bash
+curl https://browsermcp-[PROJECT_ID].run.app/health
+```
 
 ---
 
@@ -124,6 +160,22 @@ curl -X POST http://127.0.0.1:3001/mcp \
 
 ---
 
+## ☁️ Cloud Run Features
+
+| Feature | Details |
+|---------|---------|
+| **Deployment** | Automated via GitHub Actions |
+| **Memory** | 512 MB per instance |
+| **CPU** | 1 vCPU per instance |
+| **Timeout** | 3600 seconds (1 hour) |
+| **Max Instances** | 100 (auto-scaling) |
+| **Free Tier** | 2M requests/month |
+| **Cost** | $0/month for free tier usage |
+| **Region** | us-central1 |
+| **HTTPS** | Automatic, always encrypted |
+
+---
+
 ## 📊 Arquitectura
 
 ```
@@ -145,9 +197,12 @@ BROWSERMCP (Port 3001)
 | Métrica | Valor |
 |---------|-------|
 | Compilación | 3 minutos |
-| Binary | 2.8 MB |
+| Binary | 12.9 MB (pre-compiled) |
 | Memory | 50-200 MB |
 | Warnings | 0 |
+| **Cloud Run Deployment** | 5-10 minutos |
+| **Docker Image Size** | ~500 MB |
+| **Requests/Month** | 2,000,000 FREE |
 
 ---
 
@@ -180,11 +235,23 @@ RUST_LOG=debug cargo run --release
 **Última actualización:** 28 Nov 2025
 **Versión:** 3.0.0-PRO
 **Status:** ✅ Production Ready
+**Deployment:** 🚀 Cloud Run + GitHub Actions
+
+---
+
+## 📚 Recursos
+
+- **GitHub Repo**: https://github.com/Rigohl/browsermcp
+- **GitHub Actions**: https://github.com/Rigohl/browsermcp/actions
+- **Deployment Guide**: See `DEPLOY_GUIA.md`
+- **Cloud Options**: See `CLOUD_DEPLOYMENT_OPTIONS_2025.md`
+- **Docker**: Optimized production Dockerfile included
 
 ```
 ╔════════════════════════════════════════╗
 ║  🚀 BrowserMCP PRO v3.0.0-PRO 🚀      ║
-║  25 Tools • Zero Warnings • Secure    ║
+║  20+ Tools • Zero Warnings • Secure   ║
+║  Cloud-Ready • GitHub Actions CI/CD   ║
 ║  Web Automation & Scraping            ║
 ╚════════════════════════════════════════╝
 ```
