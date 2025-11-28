@@ -64,11 +64,11 @@ version = "1.18"
 
 [dependencies.wasmtime]
 optional = true
-version = "17"
+version = "24"
 
 [dependencies.wasmtime-wasi]
 optional = true
-version = "17"
+version = "24"
 
 [dependencies.zeroize]
 features = ["derive"]
